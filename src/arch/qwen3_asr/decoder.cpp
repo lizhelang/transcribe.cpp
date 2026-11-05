@@ -319,12 +319,14 @@ StepBuild build_step_graph(ggml_context *                   ctx,
     ggml_tensor * amax = ggml_argmax(ctx, logits);
     ggml_set_name(amax, "step.argmax");
 
+    sb.logits = logits;
+    ggml_set_output(sb.logits);
+
     sb.out = amax;
     ggml_set_output(sb.out);
 
     ggml_build_forward_expand(gf, sb.out);
-    // Keep raw logits alive in case the caller wants to sample (not
-    // used today, but harmless — scheduler pins the allocation).
+    // Keep raw logits alive for hotword lookahead / sampling.
     ggml_build_forward_expand(gf, logits);
 
     return sb;

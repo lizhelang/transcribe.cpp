@@ -536,6 +536,134 @@ transcribe_status resolve_context_ids(const QwenAsrModel &          model,
     return model.tok.encode(ext->context, out_ids);
 }
 
+struct HotwordMatcher {
+    std::vector<std::vector<int32_t>> multi_terms;
+    int32_t                           asr_text_id = -1;
+
+    bool empty() const { return multi_terms.empty(); }
+};
+
+size_t utf8_codepoint_count(std::string_view s) {
+    size_t count = 0;
+    for (unsigned char c : s) {
+        if ((c & 0xC0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void add_hotword_candidate(const transcribe::Tokenizer &       tok,
+                           const std::string &                 term,
+                           std::vector<std::vector<int32_t>> & out) {
+    std::vector<int32_t> ids;
+    if (tok.encode(term, ids) != TRANSCRIBE_OK) {
+        return;
+    }
+    if (ids.size() < 2 || ids.size() > 8) {
+        return;
+    }
+    for (const auto & existing : out) {
+        if (existing == ids) {
+            return;
+        }
+    }
+    out.push_back(std::move(ids));
+}
+
+HotwordMatcher extract_context_hotwords(const QwenAsrModel & model, const transcribe_run_params * params) {
+    HotwordMatcher matcher{};
+    matcher.asr_text_id = model.tok.find("<asr_text>");
+    if (params == nullptr || params->family == nullptr || !model.tok.has_encoder()) {
+        return matcher;
+    }
+    const auto * ext = reinterpret_cast<const transcribe_qwen3_asr_run_ext *>(params->family);
+    if (ext->context == nullptr || ext->context[0] == '\0') {
+        return matcher;
+    }
+
+    std::string_view sv(ext->context);
+
+    // Strip an optional instruction prefix before the first list delimiter
+    // (e.g. "术语参考（仅作转写提示，未说勿写）：词1、词2" or "Hotwords: w1, w2").
+    auto find_first_delim = [](std::string_view s) -> size_t {
+        for (size_t i = 0; i < s.size(); ++i) {
+            const char c = s[i];
+            if (c == ',' || c == ';' || c == '\n' || c == '\r') {
+                return i;
+            }
+            if (i + 3 <= s.size()) {
+                std::string_view u3 = s.substr(i, 3);
+                if (u3 == "\xe3\x80\x81" || u3 == "\xef\xbc\x8c" || u3 == "\xef\xbc\x9b") {
+                    return i;
+                }
+            }
+        }
+        return std::string_view::npos;
+    };
+
+    const size_t first_delim = find_first_delim(sv);
+    if (const size_t fw_colon = sv.find("\xef\xbc\x9a");
+        fw_colon != std::string_view::npos && (first_delim == std::string_view::npos || fw_colon < first_delim)) {
+        sv.remove_prefix(fw_colon + 3);
+    } else if (const size_t ascii_colon = sv.find(':');
+               ascii_colon != std::string_view::npos &&
+               (first_delim == std::string_view::npos || ascii_colon < first_delim) &&
+               (ascii_colon + 1 < sv.size() && (sv[ascii_colon + 1] == ' ' || sv[ascii_colon + 1] == '\t'))) {
+        sv.remove_prefix(ascii_colon + 1);
+    }
+
+    size_t pos = 0;
+    while (pos < sv.size()) {
+        size_t next      = sv.size();
+        size_t delim_len = 0;
+        for (size_t i = pos; i < sv.size(); ++i) {
+            const char c = sv[i];
+            if (c == ',' || c == ';' || c == '\n' || c == '\r') {
+                next      = i;
+                delim_len = 1;
+                break;
+            }
+            if (i + 3 <= sv.size()) {
+                std::string_view u3 = sv.substr(i, 3);
+                if (u3 == "\xe3\x80\x81" || u3 == "\xef\xbc\x8c" || u3 == "\xef\xbc\x9b") {
+                    next      = i;
+                    delim_len = 3;
+                    break;
+                }
+            }
+        }
+
+        std::string_view item = sv.substr(pos, next - pos);
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) {
+            item.remove_prefix(1);
+        }
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) {
+            item.remove_suffix(1);
+        }
+
+        if (!item.empty() && item.size() <= 64 && utf8_codepoint_count(item) >= 2) {
+            std::string term(item);
+            add_hotword_candidate(model.tok, term, matcher.multi_terms);
+            if (static_cast<unsigned char>(term[0]) < 0x80) {
+                add_hotword_candidate(model.tok, " " + term, matcher.multi_terms);
+            }
+        }
+
+        if (delim_len == 0) {
+            break;
+        }
+        pos = next + delim_len;
+    }
+
+    // Prefer longer hotword matches first when prefixes overlap.
+    std::stable_sort(
+        matcher.multi_terms.begin(), matcher.multi_terms.end(),
+        [](const std::vector<int32_t> & a, const std::vector<int32_t> & b) { return a.size() > b.size(); });
+
+    return matcher;
+}
+
 bool qwen3_asr_accepts_ext_kind(const transcribe_model * model, transcribe_ext_slot slot, uint32_t kind) {
     (void) model;
     return slot == TRANSCRIBE_EXT_SLOT_RUN && kind == TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN;
@@ -597,7 +725,8 @@ transcribe_status run(transcribe_session *          session,
     if (const transcribe_status st = resolve_context_ids(*cm, params, context_ids); st != TRANSCRIBE_OK) {
         return st;
     }
-    const std::vector<int32_t> * context_ptr = context_ids.empty() ? nullptr : &context_ids;
+    const std::vector<int32_t> * context_ptr     = context_ids.empty() ? nullptr : &context_ids;
+    const HotwordMatcher         hotword_matcher = extract_context_hotwords(*cm, params);
 
     // Pre-run abort check (Qwen3-ASR is single-shot, so this is the only
     // observation point).
@@ -929,8 +1058,7 @@ transcribe_status run(transcribe_session *          session,
 
     std::vector<int32_t> generated_ids;
     int32_t              next_tok = argmax(logits);
-    generated_ids.push_back(next_tok);
-    t_prefill_logits_us = ggml_time_us() - t_prefill_logits_start;
+    t_prefill_logits_us           = ggml_time_us() - t_prefill_logits_start;
 
     // Step loop.
     const int32_t eos_id   = cm->hparams.eos_token_id;
@@ -980,16 +1108,197 @@ transcribe_status run(transcribe_session *          session,
     }
     const int64_t t_step_build_once_us = ggml_time_us() - t_step_build_start;
 
-    // Mask buffer reused host-side across steps. Starts all -inf; per step we
-    // zero positions [0, cur_past] (attend) and leave the rest -inf.
+    // Mask buffer reused host-side across steps. Positions [0, T_prompt) are
+    // already in the KV cache after prefill; each step marks cur_past zero.
     const ggml_fp16_t        mask_zero    = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t        mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
     std::vector<ggml_fp16_t> step_mask(max_n_kv, mask_neg_inf);
+    std::fill(step_mask.begin(), step_mask.begin() + T_prompt, mask_zero);
+
+    bool               in_asr_text = (lang_prefix_ptr != nullptr);
+    std::vector<float> step_logits;
+    std::vector<float> spec_logits;
+    if (!hotword_matcher.empty()) {
+        step_logits.resize(vocab);
+        spec_logits.resize(vocab);
+    }
+
+    auto token_rank_within = [](const std::vector<float> & v, int32_t tok, int max_rank) -> bool {
+        if (tok < 0 || tok >= static_cast<int32_t>(v.size())) {
+            return false;
+        }
+        const float target = v[tok];
+        int         better = 0;
+        for (float x : v) {
+            if (x > target) {
+                if (++better >= max_rank) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    // Trie-Guided Speculative Lookahead + Shallow Fusion for multi-token hotwords.
+    // Returns true if a hotword sequence (or suffix) was accepted and appended to
+    // generated_ids, updating next_tok and cur_past.
+    auto try_hotword_select = [&](const std::vector<float> & cur_logits, int32_t top1_tok, int spec_start_past,
+                                  int64_t & set_us, int64_t & comp_us, int64_t & get_us) -> bool {
+        if (!in_asr_text || hotword_matcher.empty() || top1_tok == eos_id || top1_tok < 0 || top1_tok >= vocab) {
+            return false;
+        }
+        const float top1_logit = cur_logits[top1_tok];
+
+        // 1. Check if generated_ids already ends with all but the last token of
+        //    a hotword: if the final token is within 3.0 logits and Top-4, complete it.
+        for (const auto & term : hotword_matcher.multi_terms) {
+            const size_t L = term.size();
+            if (L < 2 || generated_ids.size() < L - 1) {
+                continue;
+            }
+            bool prefix_match = true;
+            for (size_t i = 0; i < L - 1; ++i) {
+                if (generated_ids[generated_ids.size() - (L - 1) + i] != term[i]) {
+                    prefix_match = false;
+                    break;
+                }
+            }
+            if (!prefix_match) {
+                continue;
+            }
+            const int32_t final_tok = term.back();
+            if (final_tok == top1_tok) {
+                return false;
+            }
+            if (final_tok >= 0 && final_tok < vocab) {
+                const float s_final = cur_logits[final_tok];
+                if (s_final >= 18.0f && (top1_logit - s_final) <= 3.0f && token_rank_within(cur_logits, final_tok, 4)) {
+                    next_tok = final_tok;
+                    generated_ids.push_back(next_tok);
+                    cur_past          = spec_start_past;
+                    cc->kv_cache.n    = cur_past + 1;
+                    cc->kv_cache.head = cur_past + 1;
+                    return true;
+                }
+            }
+        }
+
+        // 2. Multi-token speculative lookahead for hotwords whose first token t_0
+        //    is in Top-8 and within 8.5 logits of top1_tok.
+        constexpr float k_max_first_gap   = 8.5f;
+        constexpr float k_min_first_logit = 15.0f;
+        constexpr int   k_max_first_rank  = 8;
+        constexpr float k_max_cont_gap    = 1.5f;
+        constexpr float k_min_cont_logit  = 18.0f;
+        constexpr float k_hotword_bonus   = 3.5f;
+
+        int spec_attempts = 0;
+        for (const auto & term : hotword_matcher.multi_terms) {
+            const int M = static_cast<int>(term.size());
+            if (M < 2 || spec_start_past + M > max_n_kv || static_cast<int32_t>(generated_ids.size()) + M > max_new) {
+                continue;
+            }
+            const int32_t t0 = term[0];
+            if (t0 == top1_tok || t0 < 0 || t0 >= vocab) {
+                continue;
+            }
+            const float s0 = cur_logits[t0];
+            if (s0 < k_min_first_logit || (top1_logit - s0) > k_max_first_gap) {
+                continue;
+            }
+            if (!token_rank_within(cur_logits, t0, k_max_first_rank)) {
+                continue;
+            }
+            if (++spec_attempts > 2) {
+                break;
+            }
+
+            float sum_logits     = s0;
+            float max_cont_logit = -INFINITY;
+            bool  ok             = true;
+
+            for (int k = 1; k < M; ++k) {
+                const int     spec_past = spec_start_past + k - 1;
+                const int64_t ts0       = ggml_time_us();
+
+                const int32_t in_tok = term[k - 1];
+                ggml_backend_tensor_set(sb.input_id_in, &in_tok, 0, sizeof(int32_t));
+                const int32_t pos_val = spec_past;
+                ggml_backend_tensor_set(sb.position_in, &pos_val, 0, sizeof(int32_t));
+                const int64_t kv_idx_val = spec_past;
+                ggml_backend_tensor_set(sb.kv_idx_in, &kv_idx_val, 0, sizeof(int64_t));
+                step_mask[spec_past] = mask_zero;
+                ggml_backend_tensor_set(sb.mask_in, step_mask.data(), 0,
+                                        static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
+
+                const int64_t ts1 = ggml_time_us();
+                set_us += ts1 - ts0;
+
+                if (ggml_backend_sched_graph_compute(cc->sched, sb.graph) != GGML_STATUS_SUCCESS) {
+                    ok = false;
+                    break;
+                }
+                const int64_t tc1 = ggml_time_us();
+                comp_us += tc1 - ts1;
+
+                int32_t spec_top1 = 0;
+                ggml_backend_tensor_get(sb.out, &spec_top1, 0, sizeof(int32_t));
+                ggml_backend_tensor_get(sb.logits, spec_logits.data(), 0, spec_logits.size() * sizeof(float));
+                get_us += ggml_time_us() - tc1;
+
+                const int32_t tk = term[k];
+                if (tk < 0 || tk >= vocab || spec_top1 < 0 || spec_top1 >= vocab) {
+                    ok = false;
+                    break;
+                }
+                const float spec_top1_logit = spec_logits[spec_top1];
+                const float sk              = spec_logits[tk];
+                if (sk < k_min_cont_logit || (spec_top1_logit - sk) > k_max_cont_gap ||
+                    !token_rank_within(spec_logits, tk, 2)) {
+                    ok = false;
+                    break;
+                }
+                sum_logits += sk;
+                if (sk > max_cont_logit) {
+                    max_cont_logit = sk;
+                }
+            }
+
+            if (ok) {
+                const float mean_logit = sum_logits / static_cast<float>(M);
+                if (max_cont_logit > s0 && (mean_logit + k_hotword_bonus) > top1_logit) {
+                    for (int32_t tok : term) {
+                        generated_ids.push_back(tok);
+                    }
+                    next_tok          = term.back();
+                    cur_past          = spec_start_past + M - 1;
+                    cc->kv_cache.n    = cur_past + 1;
+                    cc->kv_cache.head = cur_past + 1;
+                    return true;
+                }
+            }
+
+            // Roll back speculative step_mask entries; KV cache slots >= spec_start_past
+            // are masked out by -inf and will be overwritten by subsequent steps.
+            std::fill(step_mask.begin() + spec_start_past, step_mask.begin() + std::min(max_n_kv, spec_start_past + M),
+                      mask_neg_inf);
+        }
+        return false;
+    };
 
     // Per-step timers.
-    int64_t       t_step_set_us     = 0;
-    int64_t       t_step_comp_us    = 0;
-    int64_t       t_step_get_us     = 0;
+    int64_t t_step_set_us  = 0;
+    int64_t t_step_comp_us = 0;
+    int64_t t_step_get_us  = 0;
+
+    // Emit the initial token(s) from prefill logits.
+    if (!try_hotword_select(logits, next_tok, T_prompt, t_step_set_us, t_step_comp_us, t_step_get_us)) {
+        generated_ids.push_back(next_tok);
+        if (next_tok == hotword_matcher.asr_text_id) {
+            in_asr_text = true;
+        }
+    }
+
     const int64_t t_step_loop_start = ggml_time_us();
     while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < max_new && cur_past + 1 <= max_n_kv) {
         const int64_t t_set0 = ggml_time_us();
@@ -1000,14 +1309,7 @@ transcribe_status run(transcribe_session *          session,
         const int64_t kv_idx_val = cur_past;
         ggml_backend_tensor_set(sb.kv_idx_in, &kv_idx_val, 0, sizeof(int64_t));
 
-        // Mask: mark the newly-added position as attendable. Positions
-        // [0, cur_past) were zeroed in prior iterations; just set the
-        // new one. (On iter 0, zero everything in [0, cur_past].)
-        if (cur_past == T_prompt) {
-            std::fill(step_mask.begin(), step_mask.begin() + cur_past + 1, mask_zero);
-        } else {
-            step_mask[cur_past] = mask_zero;
-        }
+        step_mask[cur_past] = mask_zero;
         ggml_backend_tensor_set(sb.mask_in, step_mask.data(), 0, static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
 
         const int64_t t_set1 = ggml_time_us();
@@ -1022,12 +1324,24 @@ transcribe_status run(transcribe_session *          session,
 
         int32_t argmax_tok = 0;
         ggml_backend_tensor_get(sb.out, &argmax_tok, 0, sizeof(int32_t));
+        if (in_asr_text && !hotword_matcher.empty() && argmax_tok != eos_id) {
+            ggml_backend_tensor_get(sb.logits, step_logits.data(), 0, step_logits.size() * sizeof(float));
+        }
+        t_step_get_us += ggml_time_us() - t_comp1;
+
+        if (in_asr_text && !hotword_matcher.empty() && argmax_tok != eos_id &&
+            try_hotword_select(step_logits, argmax_tok, cur_past + 1, t_step_set_us, t_step_comp_us, t_step_get_us)) {
+            continue;
+        }
+
         next_tok = argmax_tok;
         generated_ids.push_back(next_tok);
+        if (next_tok == hotword_matcher.asr_text_id) {
+            in_asr_text = true;
+        }
         cur_past += 1;
         cc->kv_cache.n    = cur_past + 1;
         cc->kv_cache.head = cur_past + 1;
-        t_step_get_us += ggml_time_us() - t_comp1;
     }
     t_step_loop_us = ggml_time_us() - t_step_loop_start;
     n_steps        = static_cast<int>(generated_ids.size()) - 1;
@@ -1579,7 +1893,11 @@ transcribe_status run_batch(transcribe_session *          session,
     if (const transcribe_status st = resolve_context_ids(*cm, params, context_ids); st != TRANSCRIBE_OK) {
         return st;
     }
-    const std::vector<int32_t> * context_ptr = context_ids.empty() ? nullptr : &context_ids;
+    const std::vector<int32_t> * context_ptr     = context_ids.empty() ? nullptr : &context_ids;
+    const HotwordMatcher         hotword_matcher = extract_context_hotwords(*cm, params);
+    if (!hotword_matcher.empty()) {
+        return run_batch_serial(cc, pcm, n_samples, n, params);
+    }
 
     // Shared language hint (v1: one run_params across the batch).
     std::vector<int32_t>         lang_prefix_ids;

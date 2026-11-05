@@ -93,6 +93,7 @@ struct StepBuild {
     ggml_tensor * position_in = nullptr;  // [1] i32, value = n_past
     ggml_tensor * kv_idx_in   = nullptr;  // [1] i64, KV write position
     ggml_tensor * mask_in     = nullptr;  // [max_n_kv, 1] f16
+    ggml_tensor * logits      = nullptr;  // [vocab_size] f32 — raw step logits
     ggml_tensor * out         = nullptr;  // [1] i32 — argmax token id
     ggml_cgraph * graph       = nullptr;
 
